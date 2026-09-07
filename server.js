@@ -2,6 +2,7 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -87,18 +88,43 @@ function buildServer() {
 const app = express();
 app.use(express.json());
 
-// The random secret in the path is the only access control here.
-app.post(`/mcp/${MCP_SECRET}`, async (req, res) => {
-  try {
+// sessionId -> transport, so follow-up requests in the same MCP session
+// (tools/list, tools/call, etc.) reach the same transport that was created
+// at initialize time. This is the standard pattern real MCP clients expect.
+const transports = {};
+
+const MCP_PATH = `/mcp/${MCP_SECRET}`; // the secret in the path is the only access control here
+
+app.post(MCP_PATH, async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"];
+  let transport;
+
+  if (sessionId && transports[sessionId]) {
+    transport = transports[sessionId];
+  } else if (!sessionId && isInitializeRequest(req.body)) {
+    transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: () => randomUUID(),
+      onsessioninitialized: (newSessionId) => {
+        transports[newSessionId] = transport;
+      },
+    });
+
+    transport.onclose = () => {
+      if (transport.sessionId) delete transports[transport.sessionId];
+    };
+
     const server = buildServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined, // stateless: one transport per request
-    });
-    res.on("close", () => {
-      transport.close();
-      server.close();
-    });
     await server.connect(transport);
+  } else {
+    res.status(400).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Bad Request: No valid session ID provided" },
+      id: null,
+    });
+    return;
+  }
+
+  try {
     await transport.handleRequest(req, res, req.body);
   } catch (err) {
     console.error("MCP request failed:", err);
@@ -111,6 +137,21 @@ app.post(`/mcp/${MCP_SECRET}`, async (req, res) => {
     }
   }
 });
+
+// GET is used by clients to open a server-to-client notification stream;
+// DELETE is used to explicitly end a session. Both need the session ID
+// from the initialize response.
+async function handleSessionRequest(req, res) {
+  const sessionId = req.headers["mcp-session-id"];
+  if (!sessionId || !transports[sessionId]) {
+    res.status(400).send("Invalid or missing session ID");
+    return;
+  }
+  await transports[sessionId].handleRequest(req, res);
+}
+
+app.get(MCP_PATH, handleSessionRequest);
+app.delete(MCP_PATH, handleSessionRequest);
 
 app.get("/", (_req, res) => res.send("OK"));
 
