@@ -88,10 +88,34 @@ function buildServer() {
 const app = express();
 app.use(express.json());
 
-// sessionId -> transport, so follow-up requests in the same MCP session
-// (tools/list, tools/call, etc.) reach the same transport that was created
-// at initialize time. This is the standard pattern real MCP clients expect.
-const transports = {};
+// sessionId -> { transport, lastSeen }, so follow-up requests in the same MCP
+// session (tools/list, tools/call, etc.) reach the same transport that was
+// created at initialize time. This is the standard pattern real MCP clients expect.
+const sessions = {};
+
+// Clients often disconnect without ending their session, so sessions idle
+// for longer than this are closed to stop them piling up in memory.
+const SESSION_IDLE_MS = (Number(process.env.SESSION_IDLE_MINUTES) || 30) * 60_000;
+
+setInterval(() => {
+  const cutoff = Date.now() - SESSION_IDLE_MS;
+  for (const session of Object.values(sessions)) {
+    if (session.lastSeen < cutoff) {
+      session.transport.close().catch((err) => console.error("Closing idle session failed:", err));
+    }
+  }
+}, Math.min(SESSION_IDLE_MS, 60_000)).unref();
+
+// Sessions only live in memory, so a restart or redeploy forgets them all.
+// The MCP spec tells clients to start a new session when they get a 404 for
+// their session ID, which is what lets them recover without a manual reconnect.
+function sendSessionNotFound(res) {
+  res.status(404).json({
+    jsonrpc: "2.0",
+    error: { code: -32001, message: "Session not found" },
+    id: null,
+  });
+}
 
 const MCP_PATH = `/mcp/${MCP_SECRET}`; // the secret in the path is the only access control here
 
@@ -99,18 +123,24 @@ app.post(MCP_PATH, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"];
   let transport;
 
-  if (sessionId && transports[sessionId]) {
-    transport = transports[sessionId];
-  } else if (!sessionId && isInitializeRequest(req.body)) {
+  if (sessionId) {
+    const session = sessions[sessionId];
+    if (!session) {
+      sendSessionNotFound(res);
+      return;
+    }
+    session.lastSeen = Date.now();
+    transport = session.transport;
+  } else if (isInitializeRequest(req.body)) {
     transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (newSessionId) => {
-        transports[newSessionId] = transport;
+        sessions[newSessionId] = { transport, lastSeen: Date.now() };
       },
     });
 
     transport.onclose = () => {
-      if (transport.sessionId) delete transports[transport.sessionId];
+      if (transport.sessionId) delete sessions[transport.sessionId];
     };
 
     const server = buildServer();
@@ -132,7 +162,7 @@ app.post(MCP_PATH, async (req, res) => {
       res.status(500).json({
         jsonrpc: "2.0",
         error: { code: -32603, message: "Internal server error" },
-        id: randomUUID(),
+        id: null,
       });
     }
   }
@@ -143,11 +173,17 @@ app.post(MCP_PATH, async (req, res) => {
 // from the initialize response.
 async function handleSessionRequest(req, res) {
   const sessionId = req.headers["mcp-session-id"];
-  if (!sessionId || !transports[sessionId]) {
-    res.status(400).send("Invalid or missing session ID");
+  if (!sessionId) {
+    res.status(400).send("Missing session ID");
     return;
   }
-  await transports[sessionId].handleRequest(req, res);
+  const session = sessions[sessionId];
+  if (!session) {
+    sendSessionNotFound(res);
+    return;
+  }
+  session.lastSeen = Date.now();
+  await session.transport.handleRequest(req, res);
 }
 
 app.get(MCP_PATH, handleSessionRequest);
