@@ -1,6 +1,6 @@
 date: 2026-10-25
 agent: unassigned
-task: Review the code, fix the two session problems, add every OpenAI image option, image input and cost reporting
+task: Review the code, fix the two session problems, add every OpenAI image option, image input, cost reporting, and uploads from Claude chats
 outcome: shipped
 files_changed: 2
 
@@ -46,9 +46,15 @@ https://developers.openai.com/api/docs/pricing on 25 October 2026):
 - server.js: 5-minute time limit on OpenAI calls, a clear error when no image
   comes back, and progress updates every 15 seconds for clients that ask.
 - README.md: setup, tools, options and cost.
+- server.js: new create_upload_link tool for images attached in a Claude
+  chat. It returns a one-time link (/upload/<token>, 30 minutes, no
+  MCP_SECRET in it) and the image ID the upload will get. PUT or raw POST
+  takes the bytes (curl from Claude's code environment); GET shows an upload
+  page for people. PUBLIC_URL overrides the link address.
 
-Tested against a fake OpenAI endpoint: 7 session checks and 15 tool checks,
-all passing. Not tested against the real OpenAI API, because this
+Tested against a fake OpenAI endpoint: 7 session checks, 15 tool checks and
+15 upload checks (including the upload page in a real browser at phone
+width), all passing. Not tested against the real OpenAI API, because this
 environment has no API key.
 
 ## What I did not do, and why
@@ -61,26 +67,24 @@ environment has no API key.
   users, not for a personal connector.
 - Did not commit package-lock.json. That changes what deploys install and is
   the owner's decision.
-- Images uploaded in a Claude chat cannot easily be passed to edit_image.
-  Claude can pass an image ID, a link, or base64 it already has as text.
+- Did not build the in-chat upload box (MCP Apps). The upload link covers
+  the need, and the box cannot be tested here without a real Claude host.
+- Did not test the upload link from inside a real Claude chat. Whether Claude
+  can send the file depends on the owner's code execution and network
+  settings.
 
 ## What the next session should know
 
-- The owner asked how to get images uploaded in a Claude chat into
-  edit_image. Remote MCP tools cannot read chat attachments: Claude only
-  passes text it writes, and it cannot write out an image's bytes. Options
-  researched, not built yet:
-  1. Upload link: a tool returns a one-time URL plus the future image ID.
-     Claude's code environment (code execution and file creation, files in
-     /mnt/user-data/uploads per Higgsfield's connector) can PUT the file with
-     curl. This needs network access to the server's domain, which may be
-     off or limited to package managers. Opened in a browser, the same link
-     can show an upload page, which works on any device.
-  2. In-chat upload box (MCP Apps, @modelcontextprotocol/ext-apps 2.0.3): the
-     widget can call an app-only tool with callServerTool and tell Claude the
-     ID with updateModelContext or sendMessage. Claude supports MCP Apps.
-     More work, and it cannot be tested here without a real Claude host.
-  Higgsfield's connector uses both: link first, box as the fallback.
+- Remote MCP tools cannot read chat attachments: Claude only passes text it
+  writes, and it cannot write out an image's bytes. create_upload_link is the
+  answer that was built. Claude's code environment (files in
+  /mnt/user-data/uploads per Higgsfield's connector) needs network access to
+  the server's domain to use it, which may be off or limited to package
+  managers; the browser page is the fallback.
+- A possible next step is an in-chat upload box (MCP Apps,
+  @modelcontextprotocol/ext-apps 2.0.3): the widget can call an app-only
+  tool with callServerTool and tell Claude the ID with updateModelContext or
+  sendMessage. Higgsfield's connector uses that as its fallback.
 
 - Test without spending money: start the server with
   `node --import <mock> server.js`, where the mock module replaces
