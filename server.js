@@ -40,8 +40,9 @@ const imageStore = new Map(); // id -> { buffer, format }
 const IMAGE_CACHE_BYTES = (Number(process.env.IMAGE_CACHE_MB) || 100) * 1024 * 1024;
 let imageStoreBytes = 0;
 
-function storeImage(buffer, format) {
-  const id = `img_${randomBytes(6).toString("hex")}`;
+const newImageId = () => `img_${randomBytes(6).toString("hex")}`;
+
+function storeImage(buffer, format, id = newImageId()) {
   imageStore.set(id, { buffer, format });
   imageStoreBytes += buffer.length;
   for (const [oldId, old] of imageStore) {
@@ -50,6 +51,32 @@ function storeImage(buffer, format) {
     imageStoreBytes -= old.buffer.length;
   }
   return id;
+}
+
+// MCP tools cannot read files attached in a chat, so create_upload_link hands
+// out one-time links for sending an image straight to this server.
+// token -> { imageId, expires }
+const uploadLinks = new Map();
+const UPLOAD_LINK_MS = 30 * 60_000;
+
+function createUploadLink() {
+  const now = Date.now();
+  for (const [token, link] of uploadLinks) {
+    if (link.expires < now) uploadLinks.delete(token);
+  }
+  const token = randomBytes(24).toString("base64url");
+  const imageId = newImageId();
+  uploadLinks.set(token, { imageId, expires: now + UPLOAD_LINK_MS });
+  return { token, imageId };
+}
+
+// The address users reach this server on. Set PUBLIC_URL if the guess from
+// the request headers is wrong.
+function publicUrl(requestInfo) {
+  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL.replace(/\/+$/, "");
+  const headers = requestInfo?.headers ?? {};
+  const proto = headers["x-forwarded-proto"]?.split(",")[0] ?? "http";
+  return `${proto}://${headers["x-forwarded-host"] ?? headers.host}`;
 }
 
 // Checks the file's first bytes rather than trusting a URL or header.
@@ -68,9 +95,12 @@ async function loadImage(ref) {
   if (imageStore.has(ref)) {
     buffer = imageStore.get(ref).buffer;
   } else if (/^img_[0-9a-f]+$/.test(ref)) {
+    const waiting = [...uploadLinks.values()].some((link) => link.imageId === ref && link.expires > Date.now());
     throw new Error(
-      `Image ID ${ref} was not found. IDs are kept in memory only, so they stop working ` +
-        "after the server restarts or once newer images push them out."
+      waiting
+        ? `Image ${ref} has not been uploaded yet. Upload it with its link first.`
+        : `Image ID ${ref} was not found. IDs are kept in memory only, so they stop working ` +
+            "after the server restarts or once newer images push them out."
     );
   } else if (/^https?:\/\//i.test(ref)) {
     const res = await fetch(ref, { signal: AbortSignal.timeout(30_000) });
@@ -256,8 +286,9 @@ function buildServer() {
           .max(16)
           .describe(
             "1 to 16 PNG, JPEG or WebP images, each under 50 MB. Each entry is an image ID from " +
-              "generate_image or edit_image (for example img_1a2b3c4d5e6f), a public http(s) URL, " +
-              "or base64 data (plain or as a data: URL)."
+              "generate_image, edit_image or create_upload_link (for example img_1a2b3c4d5e6f), a public " +
+              "http(s) URL, or base64 data (plain or as a data: URL). For an image the user attached " +
+              "in the chat, use create_upload_link first."
           ),
         mask: z
           .string()
@@ -292,6 +323,39 @@ function buildServer() {
       }
       const data = await callOpenAI("edits", { body: form }, extra);
       return imageResult("Made", data, params);
+    }
+  );
+
+  server.registerTool(
+    "create_upload_link",
+    {
+      title: "Create Upload Link",
+      description:
+        "This connector cannot read images attached in the chat. To use one with edit_image, call this " +
+        "tool to get a one-time upload link and the image ID the upload will have. Call it once per image. " +
+        "If your code environment can read the attached file (for example under /mnt/user-data/uploads), " +
+        "upload it yourself with the curl command in the result, then pass the image ID to edit_image. " +
+        "If you cannot read the file or the upload fails (for example because network access is blocked), " +
+        "give the user the link: they open it in a browser, pick the image, and tell you when it is done.",
+      inputSchema: {},
+    },
+    async (_args, extra) => {
+      const { token, imageId } = createUploadLink();
+      const url = `${publicUrl(extra.requestInfo)}/upload/${token}`;
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              `Upload link: ${url}`,
+              `Image ID once uploaded: ${imageId}`,
+              `Upload from a code environment: curl --fail-with-body --upload-file '<path to image>' '${url}'`,
+              "Or give the user the link to open in a browser.",
+              `The link works for one upload and expires in ${UPLOAD_LINK_MS / 60_000} minutes.`,
+            ].join("\n"),
+          },
+        ],
+      };
     }
   );
 
@@ -401,6 +465,105 @@ async function handleSessionRequest(req, res) {
 
 app.get(MCP_PATH, handleSessionRequest);
 app.delete(MCP_PATH, handleSessionRequest);
+
+// Upload links from create_upload_link. GET shows a page for people. PUT (or
+// POST) takes the raw image bytes, from that page or from curl in Claude's code
+// environment.
+const UPLOAD_PATH = "/upload/:token";
+
+function findUploadLink(req, res, next) {
+  const link = uploadLinks.get(req.params.token);
+  if (!link || link.expires < Date.now()) {
+    const message = "This upload link has expired or was already used. Ask Claude for a new one.";
+    if (req.method === "GET") res.status(404).type("html").send(uploadPage(`<p>${message}</p>`));
+    else res.status(404).json({ error: message });
+    return;
+  }
+  req.uploadLink = link;
+  next();
+}
+
+app.get(UPLOAD_PATH, findUploadLink, (_req, res) => {
+  res.type("html").send(
+    uploadPage(`
+      <p>Pick a PNG, JPEG or WebP image under 50 MB. This link works for one upload.</p>
+      <form id="form">
+        <input type="file" id="file" accept="image/png,image/jpeg,image/webp" required>
+        <p><button type="submit">Upload</button></p>
+      </form>
+      <p id="status" role="status"></p>
+      <script>
+        const form = document.getElementById("form");
+        const status = document.getElementById("status");
+        const button = form.querySelector("button");
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const file = document.getElementById("file").files[0];
+          if (file.size > ${MAX_INPUT_IMAGE_BYTES}) {
+            status.textContent = "This image is larger than 50 MB.";
+            return;
+          }
+          status.textContent = "Uploading...";
+          button.disabled = true;
+          try {
+            const res = await fetch(location.href, { method: "PUT", body: file });
+            const result = await res.json().catch(() => ({ error: "Upload failed (HTTP " + res.status + ")." }));
+            if (!res.ok) throw new Error(result.error);
+            form.hidden = true;
+            status.textContent = "Done. Go back to Claude and say the image is uploaded.";
+          } catch (err) {
+            status.textContent = err.message;
+            button.disabled = false;
+          }
+        });
+      </script>`)
+  );
+});
+
+const receiveUpload = [findUploadLink, express.raw({ type: () => true, limit: MAX_INPUT_IMAGE_BYTES }), (req, res) => {
+  const format = Buffer.isBuffer(req.body) && detectFormat(req.body);
+  if (!format) {
+    const sentAsForm = req.headers["content-type"]?.startsWith("multipart/form-data");
+    res.status(415).json({
+      error: sentAsForm
+        ? "Send the file itself, not a form. For example: curl --upload-file photo.png '<link>'"
+        : "That is not a PNG, JPEG or WebP image.",
+    });
+    return;
+  }
+  uploadLinks.delete(req.params.token);
+  storeImage(req.body, format, req.uploadLink.imageId);
+  res.json({ image_id: req.uploadLink.imageId, format, bytes: req.body.length });
+}];
+
+app.put(UPLOAD_PATH, receiveUpload);
+app.post(UPLOAD_PATH, receiveUpload);
+
+app.use((err, _req, res, next) => {
+  if (err.type !== "entity.too.large") return next(err);
+  res.status(413).json({ error: "The image is larger than 50 MB." });
+});
+
+function uploadPage(body) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Upload an image</title>
+  <style>
+    body { font-family: system-ui, sans-serif; line-height: 1.5; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+    input, button { font: inherit; }
+    button { padding: 0.5rem 1.25rem; }
+    #status { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Upload an image for Claude</h1>
+  ${body}
+</body>
+</html>`;
+}
 
 app.get("/", (_req, res) => res.send("OK"));
 

@@ -16,6 +16,7 @@ what the request cost.
    | `PORT` | No | Port to listen on. Defaults to 3000. |
    | `SESSION_IDLE_MINUTES` | No | Close client sessions unused for this long. Defaults to 30. |
    | `IMAGE_CACHE_MB` | No | Memory for recent images that `edit_image` can reuse by ID. Defaults to 100. |
+   | `PUBLIC_URL` | No | The server's public address, such as `https://my-images.onrender.com`, used in upload links. Set it only if the links point to the wrong address. |
 
 3. Start: `npm start`
 4. In your MCP client, add the connector address
@@ -35,7 +36,7 @@ Makes images from a text prompt.
 Changes images, or uses them as references for a new image. You give 1 to 16
 images. Each one can be:
 
-- an image ID from an earlier result, such as `img_1a2b3c4d5e6f`
+- an image ID from an earlier result or an upload link, such as `img_1a2b3c4d5e6f`
 - a public `http` or `https` link to the image
 - the image as base64 text, plain or as a `data:` URL
 
@@ -44,6 +45,23 @@ Images must be PNG, JPEG or WebP and under 50 MB each. You can also give a
 
 Image IDs are kept in memory only. They stop working when the server
 restarts, or once newer images push them out of the `IMAGE_CACHE_MB` limit.
+
+### `create_upload_link`
+
+Lets you use an image you attached in a Claude chat. Connectors cannot read
+chat attachments, so the image has to reach the server another way. This tool
+gives Claude a one-time upload link and the image ID the upload will get.
+
+- **Claude uploads it for you.** If Claude can run code in your chat, it
+  sends your attached image to the link itself, then edits it. For this, turn
+  on these in Claude's Settings, under Capabilities:
+  - **Code execution and file creation**
+  - **network access** that includes your server's address
+- **You upload it.** If Claude can't, it gives you the link. Open it in any
+  browser, including on your phone, pick the image, and tell Claude it is
+  uploaded.
+
+A link works for one upload and expires after 30 minutes.
 
 ### Options for both tools
 
