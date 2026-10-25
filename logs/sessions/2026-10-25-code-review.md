@@ -66,6 +66,22 @@ environment has no API key.
 
 ## What the next session should know
 
+- The owner asked how to get images uploaded in a Claude chat into
+  edit_image. Remote MCP tools cannot read chat attachments: Claude only
+  passes text it writes, and it cannot write out an image's bytes. Options
+  researched, not built yet:
+  1. Upload link: a tool returns a one-time URL plus the future image ID.
+     Claude's code environment (code execution and file creation, files in
+     /mnt/user-data/uploads per Higgsfield's connector) can PUT the file with
+     curl. This needs network access to the server's domain, which may be
+     off or limited to package managers. Opened in a browser, the same link
+     can show an upload page, which works on any device.
+  2. In-chat upload box (MCP Apps, @modelcontextprotocol/ext-apps 2.0.3): the
+     widget can call an app-only tool with callServerTool and tell Claude the
+     ID with updateModelContext or sendMessage. Claude supports MCP Apps.
+     More work, and it cannot be tested here without a real Claude host.
+  Higgsfield's connector uses both: link first, box as the fallback.
+
 - Test without spending money: start the server with
   `node --import <mock> server.js`, where the mock module replaces
   `globalThis.fetch` for api.openai.com. Set OPENAI_API_KEY to any value and
