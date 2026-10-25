@@ -1,51 +1,68 @@
 date: 2026-10-25
 agent: unassigned
-task: Check the code before the owner makes some changes
-outcome: investigated
-files_changed: 0
+task: Review the code, fix the two session problems, add every OpenAI image option, image input and cost reporting
+outcome: shipped
+files_changed: 2
 
 ## What I found
 
-The server works for the normal case. I ran it against a fake OpenAI
-endpoint: initialize, tools/list and generate_image all behave as expected,
-and OpenAI errors (such as a 400) come back to the client as readable tool
-errors.
+The server worked for the normal case. The review found two problems that
+affect real users:
 
-Problems, most important first:
+1. Unknown session IDs got HTTP 400, not 404. Sessions live only in memory,
+   so every restart, redeploy or sleep forgets them. The MCP spec says
+   clients start a new session only on a 404, so clients stayed stuck until
+   someone reconnected by hand.
+2. Sessions were only removed when the client sent DELETE, so sessions from
+   clients that just disconnected piled up in memory.
 
-1. Unknown session IDs get HTTP 400, not 404 (server.js:118-124 and
-   server.js:146-148). Sessions live only in memory, so every restart,
-   redeploy or sleep of the host forgets them. The MCP spec says clients
-   start a new session only when they get a 404. With a 400, a connected
-   client stays stuck until the user reconnects by hand. The SDK's own
-   transport uses 404 with code -32001 "Session not found" for this case.
-2. Sessions are only removed when the client sends DELETE
-   (server.js:94, 112-114). Clients that just disconnect leave their
-   session in memory for as long as the process runs.
-3. If OpenAI returns no image, the user sees
-   "Cannot read properties of undefined (reading 'b64_json')"
-   (server.js:69) instead of a clear message.
-4. The OpenAI call has no time limit (server.js:46).
-5. Small tidy-ups: the size and quality defaults are written twice
-   (server.js:55-56 and 70-71); the 500 error uses a random UUID as the
-   JSON-RPC id instead of null (server.js:135).
-6. No package-lock.json is committed, so each deploy can install different
-   dependency versions.
-7. The README does not say which environment variables to set
-   (OPENAI_API_KEY, MCP_SECRET, optional PORT) or what URL to give a client.
-8. The secret in the URL is the only access control. Anyone who has the URL
-   can spend the OpenAI balance.
+Smaller findings: a confusing error when OpenAI returned no image, no time
+limit on the OpenAI call, defaults written twice, and a random JSON-RPC id on
+internal errors.
+
+What OpenAI offers now (checked against the openai npm package 7.43.0 and
+https://developers.openai.com/api/docs/pricing on 25 October 2026):
+
+- gpt-image-1 was shut down on 23 October 2026. DALL-E models are retired.
+- Current models: gpt-image-2, gpt-image-2.5-flare, gpt-image-2.5-sunburst,
+  gpt-image-1.5, gpt-image-1-mini, chatgpt-image-latest.
+- OpenAI bills per token and returns a usage object, so the exact cost can be
+  worked out per request. Cached-input prices do not apply to the Images API.
+- /v1/images/edits takes multipart uploads only (field `image[]`, up to 16).
+- platform.openai.com blocks automated fetches. developers.openai.com works.
 
 ## What I changed
 
-Nothing in the source. This log entry is the only new file.
+- server.js: unknown session IDs now get 404 with code -32001. Sessions idle
+  for SESSION_IDLE_MINUTES (default 30) are closed.
+- server.js: new edit_image tool. Images can be IDs of images the server made
+  earlier, http(s) URLs, or base64. Supports mask and input_fidelity.
+- server.js: both tools take model, quality (with xhigh and max), custom
+  sizes, n, background, output_format, output_compression; generate_image
+  also takes moderation.
+- server.js: every result reports its cost from OpenAI's token usage and a
+  PRICES table. Each image gets an ID kept in memory (IMAGE_CACHE_MB,
+  default 100).
+- server.js: 5-minute time limit on OpenAI calls, a clear error when no image
+  comes back, and progress updates every 15 seconds for clients that ask.
+- README.md: setup, tools, options and cost.
+
+Tested against a fake OpenAI endpoint: 7 session checks and 15 tool checks,
+all passing. Not tested against the real OpenAI API, because this
+environment has no API key.
 
 ## What I did not do, and why
 
-I did not fix anything. The owner asked for a check first and said they want
-to make their own changes, so I reported the findings and waited for them.
-I did not check the per-image prices in the tool description against
-OpenAI's current price list.
+- Did not test with real OpenAI calls (no key here). The first real call of
+  each tool should be checked, especially edit_image's upload format.
+- Did not add streaming partial images. An MCP tool result arrives in one
+  piece, so partial images would not reach the user.
+- Did not add safety_identifier or user. They are for apps with many end
+  users, not for a personal connector.
+- Did not commit package-lock.json. That changes what deploys install and is
+  the owner's decision.
+- Images uploaded in a Claude chat cannot easily be passed to edit_image.
+  Claude can pass an image ID, a link, or base64 it already has as text.
 
 ## What the next session should know
 
@@ -53,5 +70,8 @@ OpenAI's current price list.
   `node --import <mock> server.js`, where the mock module replaces
   `globalThis.fetch` for api.openai.com. Set OPENAI_API_KEY to any value and
   MCP_SECRET to a test value.
-- The first two findings are the ones that affect real users. They are
-  small fixes in server.js.
+- The PRICES table in server.js must be updated by hand when OpenAI changes
+  its prices.
+- The SDK client gives up after 60 seconds by default unless the client app
+  turns on resetTimeoutOnProgress. Slow, top-quality images may hit that in
+  some clients.
